@@ -10,6 +10,7 @@ from nndet.arch.encoder.SelfAttention import SelfAttention3D  # 导入自注意�
 from nndet.arch.encoder.swimTransformer import SwinTransformer3D
 import torch.nn.functional as F  # 加入插值函数
 import logging
+from nndet.arch.encoder.window_attention_fusion import WindowAttentionFusion
 
 # 配置日志级别和格式
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -18,17 +19,24 @@ logger = logging.getLogger(__name__)
 __all__ = ["Encoder"]
 
 class SelfAttentionFusion(nn.Module):
-    def __init__(self, conv_channels, transformer_channels, fused_channels):
+    def __init__(self, conv_channels, transformer_channels, fused_channels, window_size, num_heads):
         super(SelfAttentionFusion, self).__init__()
         # 投影卷积特征和Transformer特征到相同的维度
         self.conv_proj = nn.Conv3d(conv_channels, fused_channels, kernel_size=1)
         self.transformer_proj = nn.Conv3d(transformer_channels, fused_channels, kernel_size=1)
         
-        # 自注意力模块
-        self.self_attention = SelfAttention3D(fused_channels * 2)
+        # 使用窗口自注意力模块
+        self.self_attention = WindowAttentionFusion(
+            dim=fused_channels * 2,
+            window_size=window_size,
+            num_heads=num_heads,
+            qkv_bias=True,
+            attn_drop=0.,
+            proj_drop=0.,
+        )
         
-        # 残差连接，如果卷积通道数和融合通道数不同，则添加1x1卷积调整维度
-        self.residual_conv = nn.Conv3d(conv_channels, fused_channels, kernel_size=1) if conv_channels != fused_channels else nn.Identity()
+        # 残差连接
+        self.residual_conv = nn.Identity()
     
     def forward(self, conv_feat, transformer_feat):
         # 投影到相同维度
@@ -38,18 +46,18 @@ class SelfAttentionFusion(nn.Module):
         # 拼接特征
         combined = torch.cat([conv_feat_proj, transformer_feat_proj], dim=1)  # (B, 2*C, D, H, W)
         
-        # 使用SelfAttention3D进行融合
+        # 使用窗口自注意力进行融合
         fused_feat = self.self_attention(combined)  # (B, 2*C, D, H, W)
         
         # 分离卷积和Transformer特征
-        conv_fused, transformer_fused = torch.split(fused_feat, conv_feat_proj.size(1), dim=1)
+        C = conv_feat_proj.size(1)
+        conv_fused, transformer_fused = torch.split(fused_feat, C, dim=1)
         
         # 加权融合
         fused_feat = conv_fused + transformer_fused
         
-        # 残差连接，将原始卷积输出加回到融合输出上
-        residual = self.residual_conv(conv_feat)  # 原始卷积特征经过调整后添加
-        fused_feat = fused_feat + residual  # 加上残差
+        # 残差连接
+        fused_feat = fused_feat + self.residual_conv(conv_feat)
         
         return fused_feat
 
@@ -87,6 +95,7 @@ class Encoder(AbstractEncoder):
 
         stages = []
         self.out_channels = []
+        self.self_attention_fusion_modules = nn.ModuleList()
         in_ch = in_channels
         if isinstance(strides[0], int):
             strides = [tuple([s] * self.dim) for s in strides]
@@ -95,13 +104,16 @@ class Encoder(AbstractEncoder):
         # 定义并行的Swin Transformer分支
         self.use_transformer = True
         if self.use_transformer:
+            # 确保 depths 和 num_heads 的长度与 self.num_stages 一致
+            self.depths = [2] * self.num_stages
+            self.num_heads = [4 * (2 ** i) for i in range(self.num_stages)]  # 例如 [4, 8, 16, 32, ...]
             self.transformer = SwinTransformer3D(
                 in_chans=in_channels,
                 embed_dim=start_channels,
-                window_size=(4,8,8),
+                window_size=(2,7,7),
                 patch_size=(2,4,4),
-                depths=[4,6,8],
-                num_heads=[4, 8, 16],
+                depths=self.depths,
+                num_heads=self.num_heads,
                 mlp_ratio=4.,
                 qkv_bias=True,
                 drop_rate=0.,
@@ -109,7 +121,8 @@ class Encoder(AbstractEncoder):
                 drop_path_rate=0.2,
                 norm_layer=nn.LayerNorm
             )
-            transformer_out_channels = start_channels * (2 ** (len([4,4,4]) - 1))
+            # 计算每个阶段的Transformer输出通道数
+            self.transformer_out_channels = [int(start_channels * 2 ** i) for i in range(self.num_stages)]
 
         for stage_id in range(self.num_stages):
             current_in_channels = in_ch
@@ -142,37 +155,47 @@ class Encoder(AbstractEncoder):
 
             stages.append(nn.Sequential(_block, se, drop_block))
 
-        self.stages = torch.nn.ModuleList(stages)
+            # 初始化 SelfAttentionFusion 模块
+            if self.use_transformer:
+                fused_channels = in_ch  # 假设融合后的通道数与卷积特征的输出通道数相同
+                transformer_channels = self.transformer_out_channels[stage_id]
+                window_size = self.transformer.window_size  # 使用与 Swin Transformer 相同的窗口大小
+                num_heads = self.num_heads[stage_id]
+                self_attention_fusion = SelfAttentionFusion(
+                    conv_channels=in_ch,
+                    transformer_channels=transformer_channels,
+                    fused_channels=fused_channels,
+                    window_size=window_size,
+                    num_heads=num_heads
+                )
+                self.self_attention_fusion_modules.append(self_attention_fusion)
 
-        # SelfAttentionFusion 初始化
-        if self.use_transformer:
-            self.self_attention_fusion = SelfAttentionFusion(
-                conv_channels=in_ch,
-                transformer_channels=transformer_out_channels,
-                fused_channels=in_ch
-            )
+        self.stages = torch.nn.ModuleList(stages)
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         outputs = []
 
         # Transformer分支的特征
         if self.use_transformer:
-            transformer_feat = self.transformer(x)
+            transformer_feats = self.transformer(x)
 
         for stage_id, module in enumerate(self.stages):
             x = module(x)
-
-            # 在最后一层进行特征融合
-            if self.use_transformer and stage_id == self.num_stages - 1:
+            if self.use_transformer and stage_id < len(self.transformer_out_channels):
+                # 获取对应阶段的Transformer特征
+                transformer_feat = transformer_feats[stage_id]
                 # 调整 transformer_feat 的尺寸以匹配 x
-                transformer_feat_resized = F.interpolate(transformer_feat, size=x.shape[2:], mode='trilinear', align_corners=False)
+                transformer_feat_resized = F.interpolate(
+                    transformer_feat, size=x.shape[2:], mode='trilinear', align_corners=False)
                 # 使用 SelfAttentionFusion 进行融合
-                x = self.self_attention_fusion(x, transformer_feat_resized)
+                x = self.self_attention_fusion_modules[stage_id](x, transformer_feat_resized)
 
             if stage_id in self.out_stages:
                 outputs.append(x)
 
         return outputs
+
+
 
     def get_channels(self) -> List[int]:
         """
@@ -181,11 +204,7 @@ class Encoder(AbstractEncoder):
         out_channels = []
         for stage_id in range(self.num_stages):
             if stage_id in self.out_stages:
-                # 如果使用了融合，通道数需要调整
-                if self.use_transformer and stage_id == self.num_stages - 1:
-                    out_channels.append(self.out_channels[stage_id])  # 假设 SelfAttentionFusion 保持通道数不变
-                else:
-                    out_channels.append(self.out_channels[stage_id])
+                out_channels.append(self.out_channels[stage_id])
         return out_channels
 
     def get_strides(self) -> List[List[int]]:
@@ -197,7 +216,7 @@ class Encoder(AbstractEncoder):
             if stage_id == 0:
                 out_strides.append([1] * self.dim)
             else:
-                new_stride = [prev_stride * pool_size for prev_stride, pool_size
+                new_stride = [prev_stride * s for prev_stride, s
                               in zip(out_strides[stage_id - 1], self.strides[stage_id - 1])]
                 out_strides.append(new_stride)
         return out_strides

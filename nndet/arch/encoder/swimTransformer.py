@@ -240,8 +240,8 @@ class SwinTransformer3D(nn.Module):
     def __init__(self,
                  in_chans=1,
                  embed_dim=32,
-                 depths=[2],  # Reduced number of layers to prevent D_p=1
-                 num_heads=[4, 8],
+                 depths=[2, 2, 2],
+                 num_heads=[4, 8, 16],
                  window_size=(2, 7, 7),
                  patch_size=(2, 4, 4),
                  mlp_ratio=4.,
@@ -264,6 +264,13 @@ class SwinTransformer3D(nn.Module):
         self.norm_layer = norm_layer
         self.num_heads = num_heads
         self.depths = depths
+        assert len(self.depths) == self.num_layers, "Depths length mismatch"
+        assert len(self.num_heads) == self.num_layers, "Num_heads length mismatch"
+
+        # 打印检查
+        print(f"SwinTransformer3D - num_layers: {self.num_layers}")
+        print(f"Depths: {self.depths}")
+        print(f"Num heads: {self.num_heads}")
 
         # 计算补丁嵌入的维度
         self.patch_dim = (
@@ -312,9 +319,7 @@ class SwinTransformer3D(nn.Module):
     def forward(self, x):
         B, C, D, H, W = x.shape
         x = self.patch_embed(x)  # (B, N_patches, patch_dim)
-        #logger.info(f"After patch embedding, x shape: {x.shape}")
         x = self.linear(x)       # (B, N_patches, embed_dim)
-        #logger.info(f"After linear projection, x shape: {x.shape}")
         x = self.pos_drop(x)
 
         # 计算初始的输入分辨率
@@ -323,6 +328,7 @@ class SwinTransformer3D(nn.Module):
         W_p = W // self.patch_embed.patch_size[2]
         input_resolution = (D_p, H_p, W_p)
 
+        features = []
         layer_index = 0
         while layer_index < len(self.layers):
             layer = self.layers[layer_index]
@@ -330,6 +336,10 @@ class SwinTransformer3D(nn.Module):
             if isinstance(layer, nn.ModuleList):
                 for block in layer:
                     x = block(x, input_resolution)
+                # 收集当前阶段的特征
+                D_p, H_p, W_p = input_resolution
+                x_feature = x.view(B, D_p, H_p, W_p, -1).permute(0, 4, 1, 2, 3).contiguous()  # (B, C, D_p, H_p, W_p)
+                features.append(x_feature)
                 layer_index += 1
             # 如果是 PatchMerging3D 层
             elif isinstance(layer, PatchMerging3D):
@@ -349,5 +359,8 @@ class SwinTransformer3D(nn.Module):
         # 重塑 x 的形状
         D_p, H_p, W_p = input_resolution
         x = x.view(B, D_p, H_p, W_p, -1).permute(0, 4, 1, 2, 3).contiguous()  # (B, C, D_p, H_p, W_p)
-        return x
+        features[-1] = x  # 更新最后一个特征
+
+        return features  # 返回每个阶段的特征列表
+
 
